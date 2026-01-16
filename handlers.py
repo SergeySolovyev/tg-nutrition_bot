@@ -776,75 +776,111 @@ async def cmd_check_progress(message: Message):
 
 
 @router.message(Command("plot"))
+@router.message(Command("graphs"))
 async def cmd_plot(message: Message, command: CommandObject):
-    prof = await ensure_profile(message.from_user.id)
-    if not prof:
-        await message.answer("Сначала настрой профиль: /set_profile")
-        return
+    try:
+        prof = await ensure_profile(message.from_user.id)
+        if not prof:
+            await message.answer("Сначала настрой профиль: /set_profile")
+            return
 
-    days_arg = (command.args or "").strip()
-    limit = parse_int(days_arg) if days_arg else 14
-    if limit is None or limit <= 0 or limit > 365:
-        limit = 14
+        days_arg = (command.args or "").strip()
+        limit = parse_int(days_arg) if days_arg else 14
+        if limit is None or limit <= 0 or limit > 365:
+            limit = 14
 
-    # lazy import for faster bot start
-    import matplotlib
+        # lazy import for faster bot start
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from datetime import datetime
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+        rows = await store.get_last_days(message.from_user.id, limit=limit)
+        if not rows:
+            await message.answer("Пока нет данных для графиков. Сделай хотя бы один /log_water или /log_food")
+            return
 
-    rows = await store.get_last_days(message.from_user.id, limit=limit)
-    if not rows:
-        await message.answer("Пока нет данных для графиков. Сделай хотя бы один /log_water или /log_food")
-        return
+        if len(rows) < 2:
+            await message.answer(f"Нужно минимум 2 дня данных для графиков. Сейчас только {len(rows)} день. Используйте /log_water и /log_food для добавления данных.")
+            return
 
-    labels = []
-    water = []
-    water_goal = []
-    cal = []
-    cal_goal = []
+        labels = []
+        water = []
+        water_goal = []
+        cal = []
+        cal_goal = []
+        dates = []
 
-    for day_key, d in rows:
-        labels.append(day_key[5:])  # MM-DD
-        water.append(int(d.get("logged_water_ml", 0)))
-        wg = int(d.get("water_target_ml", 0)) + int(d.get("workout_extra_water_ml", 0))
-        water_goal.append(wg)
-        cal.append(float(d.get("logged_calories", 0)))
-        cg = int(d.get("calorie_target", 0)) or int(prof.get("calorie_goal", 0))
-        cal_goal.append(cg)
+        for day_key, d in rows:
+            try:
+                date_obj = datetime.fromisoformat(day_key).date()
+                dates.append(date_obj)
+                labels.append(day_key[5:])  # MM-DD
+                water.append(int(d.get("logged_water_ml", 0)))
+                wg = int(d.get("water_target_ml", 0)) + int(d.get("workout_extra_water_ml", 0))
+                if wg == 0:
+                    # Если цель не установлена, рассчитаем её
+                    temp = await get_city_temperature_c(prof["city"])
+                    wg = calc_water_goal_ml(prof["weight_kg"], prof["activity_min"], temp) + int(d.get("workout_extra_water_ml", 0))
+                water_goal.append(wg)
+                cal.append(float(d.get("logged_calories", 0)))
+                cg = int(d.get("calorie_target", 0)) or int(prof.get("calorie_goal", 0))
+                cal_goal.append(cg)
+            except Exception as e:
+                logger.error(f"Ошибка обработки дня {day_key}: {e}")
+                continue
 
-    # Water plot
-    fig = plt.figure()
-    plt.plot(labels, water, marker="o")
-    plt.plot(labels, water_goal, marker="o")
-    plt.title("Вода: выпито vs цель")
-    plt.xlabel("Дата")
-    plt.ylabel("мл")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
+        if not labels:
+            await message.answer("Не удалось обработать данные для графиков.")
+            return
 
-    buf1 = io.BytesIO()
-    fig.savefig(buf1, format="png")
-    plt.close(fig)
-    buf1.seek(0)
+        # Water plot
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+        ax1.plot(labels, water, marker="o", label="Выпито (мл)", linewidth=2, markersize=6)
+        ax1.plot(labels, water_goal, marker="s", label="Цель (мл)", linewidth=2, markersize=6, linestyle="--", alpha=0.7)
+        ax1.set_xlabel("Дата", fontsize=12)
+        ax1.set_ylabel("Вода (мл)", fontsize=12)
+        ax1.set_title("Прогресс по воде", fontsize=14, fontweight="bold")
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
 
-    # Calories plot
-    fig2 = plt.figure()
-    plt.plot(labels, cal, marker="o")
-    plt.plot(labels, cal_goal, marker="o")
-    plt.title("Калории: съедено vs цель")
-    plt.xlabel("Дата")
-    plt.ylabel("ккал")
-    plt.xticks(rotation=45, ha="right")
-    plt.tight_layout()
+        buf1 = io.BytesIO()
+        fig.savefig(buf1, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        buf1.seek(0)
 
-    buf2 = io.BytesIO()
-    fig2.savefig(buf2, format="png")
-    plt.close(fig2)
-    buf2.seek(0)
+        # Calories plot
+        fig2, ax2 = plt.subplots(figsize=(10, 6))
+        ax2.plot(labels, cal, marker="o", label="Съедено (ккал)", linewidth=2, markersize=6, color="orange")
+        ax2.plot(labels, cal_goal, marker="s", label="Цель (ккал)", linewidth=2, markersize=6, linestyle="--", alpha=0.7, color="red")
+        ax2.set_xlabel("Дата", fontsize=12)
+        ax2.set_ylabel("Калории (ккал)", fontsize=12)
+        ax2.set_title("Прогресс по калориям", fontsize=14, fontweight="bold")
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3)
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
 
-    await message.answer_photo(BufferedInputFile(buf1.getvalue(), filename="water.png"), caption="График воды")
-    await message.answer_photo(BufferedInputFile(buf2.getvalue(), filename="calories.png"), caption="График калорий")
+        buf2 = io.BytesIO()
+        fig2.savefig(buf2, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig2)
+        buf2.seek(0)
+
+        await message.answer_photo(
+            BufferedInputFile(buf1.getvalue(), filename="water.png"),
+            caption=f"📊 График прогресса по воде ({len(labels)} дней)"
+        )
+        await message.answer_photo(
+            BufferedInputFile(buf2.getvalue(), filename="calories.png"),
+            caption=f"📊 График прогресса по калориям ({len(labels)} дней)"
+        )
+
+    except Exception as e:
+        logger.error(f"Ошибка при генерации графиков для пользователя {message.from_user.id}: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка при генерации графиков: {str(e)}\n\nПроверьте, что:\n- Есть данные за минимум 2 дня\n- Используйте /log_water и /log_food для добавления данных")
 
 
 @router.message(Command("reset_today"))
